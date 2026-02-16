@@ -13,6 +13,7 @@ import (
     "sort"
     "strings"
     "sync"
+    "sync/atomic"
     "syscall"
     "time"
 )
@@ -24,7 +25,7 @@ type InodeAnalyzer struct {
     excludePatterns []string
     totalSize       int64
     processedPaths  map[string]bool
-    fileMetadata    map[string]FileMetadata
+    fileMetadata    sync.Map
     interrupted     bool
     mu              sync.RWMutex
     wg              sync.WaitGroup
@@ -154,6 +155,13 @@ func NewInodeAnalyzer(threads int, followSymlinks bool, excludePatterns []string
         threads = runtime.NumCPU()
     }
     
+    largestHeap := &FileHeap{}
+    oldestHeap := &TimeHeap{}
+    newestHeap := &TimeHeap{}
+    heap.Init(largestHeap)
+    heap.Init(oldestHeap)
+    heap.Init(newestHeap)
+    
     return &InodeAnalyzer{
         stats: Stats{
             Extensions:      make(map[string]int),
@@ -168,10 +176,9 @@ func NewInodeAnalyzer(threads int, followSymlinks bool, excludePatterns []string
         followSymlinks:  followSymlinks,
         excludePatterns: excludePatterns,
         processedPaths:  make(map[string]bool),
-        fileMetadata:    make(map[string]FileMetadata),
-        largestHeap:     &FileHeap{},
-        oldestHeap:      &TimeHeap{},
-        newestHeap:      &TimeHeap{},
+        largestHeap:     largestHeap,
+        oldestHeap:      oldestHeap,
+        newestHeap:      newestHeap,
         progressDone:    make(chan struct{}),
     }
 }
@@ -274,6 +281,10 @@ func (ia *InodeAnalyzer) isCharDevice(mode os.FileMode) bool {
 func (ia *InodeAnalyzer) AnalyzeDirectory(path string, sampleSize int, deepScan, findDuplicates bool, exportJSON, generatePlot string, ageDays *int, saveState, loadState *string, maxDepth *int) {
     ia.setupSignalHandler()
     
+    if sampleSize <= 0 {
+        sampleSize = 20
+    }
+    
     if loadState != nil {
         ia.loadCheckpoint(*loadState)
         return
@@ -339,7 +350,12 @@ func (ia *InodeAnalyzer) AnalyzeDirectory(path string, sampleSize int, deepScan,
 func (ia *InodeAnalyzer) quickScanAnalysis(root string, sampleSize int, maxDepth *int) {
     fmt.Println("Scanning filesystem...")
 
-    baseDepth := len(strings.Split(root, string(filepath.Separator)))
+    baseDepth := 0
+    for _, c := range root {
+        if c == filepath.Separator {
+            baseDepth++
+        }
+    }
 
     err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
         ia.mu.RLock()
@@ -357,7 +373,12 @@ func (ia *InodeAnalyzer) quickScanAnalysis(root string, sampleSize int, maxDepth
         }
 
         if maxDepth != nil {
-            currentDepth := len(strings.Split(path, string(filepath.Separator))) - baseDepth
+            currentDepth := 0
+            for _, c := range path[len(root):] {
+                if c == filepath.Separator {
+                    currentDepth++
+                }
+            }
             if currentDepth > *maxDepth {
                 if info.IsDir() {
                     return filepath.SkipDir
@@ -468,7 +489,7 @@ func (ia *InodeAnalyzer) quickScanAnalysis(root string, sampleSize int, maxDepth
                 Permissions: perms,
                 Extension:   ext,
             }
-            ia.fileMetadata[path] = metadata
+            ia.fileMetadata.Store(path, metadata)
             ia.mu.Unlock()
 
             fileInfo := FileInfo{
@@ -512,44 +533,14 @@ func (ia *InodeAnalyzer) quickScanAnalysis(root string, sampleSize int, maxDepth
 func (ia *InodeAnalyzer) deepScanAnalysis(root string, sampleSize int, findDuplicates bool, ageDays *int, maxDepth *int) {
     fmt.Println("Deep Analysis\n")
 
-    var paths []string
-    baseDepth := len(strings.Split(root, string(filepath.Separator)))
+    work := make(chan string, ia.threads*2)
+    var processed int32
+    var totalItems int32
 
-    err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-        if err != nil {
-            return nil
-        }
-        if maxDepth != nil {
-            currentDepth := len(strings.Split(path, string(filepath.Separator))) - baseDepth
-            if currentDepth > *maxDepth {
-                if info.IsDir() {
-                    return filepath.SkipDir
-                }
-                return nil
-            }
-        }
-        if !ia.shouldExclude(path) {
-            paths = append(paths, path)
-        }
-        return nil
-    })
-
-    if err != nil {
-        fmt.Printf("Error walking directory: %v\n", err)
-        return
+    for i := 0; i < ia.threads; i++ {
+        ia.wg.Add(1)
+        go ia.deepWorker(work, &processed, &totalItems, ageDays)
     }
-
-    totalItems := len(paths)
-    fmt.Printf("  Scanning %s items...\n", ia.humanReadableNumber(totalItems))
-
-    work := make(chan string, len(paths))
-    for _, path := range paths {
-        work <- path
-    }
-    close(work)
-
-    var progressMu sync.Mutex
-    processed := 0
 
     go func() {
         ticker := time.NewTicker(100 * time.Millisecond)
@@ -558,21 +549,17 @@ func (ia *InodeAnalyzer) deepScanAnalysis(root string, sampleSize int, findDupli
         for {
             select {
             case <-ticker.C:
-                progressMu.Lock()
-                current := processed
-                progressMu.Unlock()
+                current := atomic.LoadInt32(&processed)
+                total := atomic.LoadInt32(&totalItems)
                 
-                if totalItems > 0 {
-                    pct := float64(current) / float64(totalItems) * 100
-                    fmt.Printf("\r  Progress: %.1f%% (%d/%d)", pct, current, totalItems)
+                if total > 0 {
+                    pct := float64(current) / float64(total) * 100
+                    fmt.Printf("\r  Progress: %.1f%% (%d/%d)", pct, current, total)
                 }
                 
-                ia.mu.RLock()
-                if current >= totalItems || ia.interrupted {
-                    ia.mu.RUnlock()
+                if current >= total && total > 0 {
                     return
                 }
-                ia.mu.RUnlock()
                 
             case <-ia.progressDone:
                 return
@@ -580,32 +567,62 @@ func (ia *InodeAnalyzer) deepScanAnalysis(root string, sampleSize int, findDupli
         }
     }()
 
-    for i := 0; i < ia.threads; i++ {
-        ia.wg.Add(1)
-        go func() {
-            defer ia.wg.Done()
-            for path := range work {
-                ia.mu.RLock()
-                if ia.interrupted {
-                    ia.mu.RUnlock()
-                    return
-                }
-                ia.mu.RUnlock()
-
-                ia.analyzeItemDeep(path, ageDays)
-                
-                progressMu.Lock()
-                processed++
-                progressMu.Unlock()
-            }
-        }()
+    baseDepth := 0
+    for _, c := range root {
+        if c == filepath.Separator {
+            baseDepth++
+        }
     }
 
+    err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+        if err != nil {
+            return nil
+        }
+
+        ia.mu.RLock()
+        if ia.interrupted {
+            ia.mu.RUnlock()
+            return filepath.SkipDir
+        }
+        ia.mu.RUnlock()
+
+        if maxDepth != nil {
+            currentDepth := 0
+            for _, c := range path[len(root):] {
+                if c == filepath.Separator {
+                    currentDepth++
+                }
+            }
+            if currentDepth > *maxDepth {
+                if info.IsDir() {
+                    return filepath.SkipDir
+                }
+                return nil
+            }
+        }
+
+        if !ia.shouldExclude(path) {
+            atomic.AddInt32(&totalItems, 1)
+            select {
+            case work <- path:
+            case <-ia.progressDone:
+                return filepath.SkipDir
+            }
+        }
+        return nil
+    })
+
+    close(work)
     ia.wg.Wait()
     close(ia.progressDone)
 
+    if err != nil && !ia.interrupted {
+        fmt.Printf("Error walking directory: %v\n", err)
+    }
+
     if !ia.interrupted {
-        fmt.Printf("\r  Progress: 100%% (%d/%d)\n", totalItems, totalItems)
+        total := atomic.LoadInt32(&totalItems)
+        fmt.Printf("\r  Progress: 100%% (%d/%d)\n", total, total)
     } else {
         fmt.Println("\nScan interrupted - partial results")
     }
@@ -615,6 +632,21 @@ func (ia *InodeAnalyzer) deepScanAnalysis(root string, sampleSize int, findDupli
 
     if findDuplicates && !ia.interrupted {
         ia.findDuplicateFiles(root)
+    }
+}
+
+func (ia *InodeAnalyzer) deepWorker(work <-chan string, processed, totalItems *int32, ageDays *int) {
+    defer ia.wg.Done()
+    for path := range work {
+        ia.mu.RLock()
+        if ia.interrupted {
+            ia.mu.RUnlock()
+            return
+        }
+        ia.mu.RUnlock()
+
+        ia.analyzeItemDeep(path, ageDays)
+        atomic.AddInt32(processed, 1)
     }
 }
 
@@ -722,7 +754,7 @@ func (ia *InodeAnalyzer) analyzeItemDeep(path string, ageDays *int) {
             Permissions: perms,
             Extension:   ext,
         }
-        ia.fileMetadata[path] = metadata
+        ia.fileMetadata.Store(path, metadata)
         ia.mu.Unlock()
 
         fileInfo := FileInfo{
@@ -757,20 +789,23 @@ func (ia *InodeAnalyzer) finalizeStats(sampleSize int) {
     ia.heapMu.Lock()
     defer ia.heapMu.Unlock()
 
-    sort.Sort(sort.Reverse(ia.largestHeap))
+    largest := make([]FileInfo, 0, min(sampleSize, ia.largestHeap.Len()))
     for i := 0; i < min(sampleSize, ia.largestHeap.Len()); i++ {
-        ia.stats.LargestFiles = append(ia.stats.LargestFiles, (*ia.largestHeap)[i])
+        largest = append(largest, (*ia.largestHeap)[i])
     }
+    ia.stats.LargestFiles = largest
 
-    sort.Sort(ia.oldestHeap)
+    oldest := make([]FileInfo, 0, min(sampleSize, ia.oldestHeap.Len()))
     for i := 0; i < min(sampleSize, ia.oldestHeap.Len()); i++ {
-        ia.stats.OldestFiles = append(ia.stats.OldestFiles, (*ia.oldestHeap)[i])
+        oldest = append(oldest, (*ia.oldestHeap)[i])
     }
+    ia.stats.OldestFiles = oldest
 
-    sort.Sort(sort.Reverse(ia.newestHeap))
+    newest := make([]FileInfo, 0, min(sampleSize, ia.newestHeap.Len()))
     for i := 0; i < min(sampleSize, ia.newestHeap.Len()); i++ {
-        ia.stats.NewestFiles = append(ia.stats.NewestFiles, (*ia.newestHeap)[i])
+        newest = append(newest, (*ia.newestHeap)[i])
     }
+    ia.stats.NewestFiles = newest
 }
 
 func (ia *InodeAnalyzer) analyzeLargestDirectories(root string, sampleSize int) {
@@ -781,8 +816,9 @@ func (ia *InodeAnalyzer) analyzeLargestDirectories(root string, sampleSize int) 
         largestFile string
     })
 
-    ia.mu.RLock()
-    for path, meta := range ia.fileMetadata {
+    ia.fileMetadata.Range(func(key, value interface{}) bool {
+        path := key.(string)
+        meta := value.(FileMetadata)
         dir := filepath.Dir(path)
         stats := dirStats[dir]
         stats.size += meta.Size
@@ -792,8 +828,8 @@ func (ia *InodeAnalyzer) analyzeLargestDirectories(root string, sampleSize int) 
             stats.largestFile = filepath.Base(path)
         }
         dirStats[dir] = stats
-    }
-    ia.mu.RUnlock()
+        return true
+    })
 
     var dirs []DirInfo
     for path, stats := range dirStats {
