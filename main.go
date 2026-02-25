@@ -4,6 +4,7 @@ import (
     "container/heap"
     "crypto/md5"
     "encoding/json"
+    "flag"
     "fmt"
     "io"
     "os"
@@ -24,9 +25,9 @@ type InodeAnalyzer struct {
     followSymlinks  bool
     excludePatterns []string
     totalSize       int64
-    processedPaths  map[string]bool
+    processedPaths  sync.Map
     fileMetadata    sync.Map
-    interrupted     bool
+    interrupted     atomic.Bool
     mu              sync.RWMutex
     wg              sync.WaitGroup
     largestHeap     *FileHeap
@@ -34,31 +35,34 @@ type InodeAnalyzer struct {
     newestHeap      *TimeHeap
     heapMu          sync.Mutex
     progressDone    chan struct{}
+    startTime       time.Time
+    itemsProcessed  atomic.Int64
+    totalItems      atomic.Int64
 }
 
 type Stats struct {
-    TotalFiles        int               `json:"total_files"`
-    TotalDirs         int               `json:"total_dirs"`
-    TotalSymlinks     int               `json:"total_symlinks"`
-    TotalSockets      int               `json:"total_sockets"`
-    TotalFifos        int               `json:"total_fifos"`
-    TotalDevices      int               `json:"total_devices"`
-    Extensions        map[string]int    `json:"extensions"`
-    LargestFiles      []FileInfo        `json:"largest_files"`
-    OldestFiles       []FileInfo        `json:"oldest_files"`
-    NewestFiles       []FileInfo        `json:"newest_files"`
-    LargestDirs       []DirInfo         `json:"largest_dirs"`
-    Permissions       map[string]int    `json:"permissions"`
-    Owners            map[string]int    `json:"owners"`
-    Groups            map[string]int    `json:"groups"`
-    AgeDistribution   map[string]int    `json:"age_distribution"`
-    SizeDistribution  map[string]int    `json:"size_distribution"`
-    Duplicates        []DuplicateSet    `json:"duplicates"`
-    EmptyFiles        int               `json:"empty_files"`
-    EmptyDirs         int               `json:"empty_dirs"`
-    BrokenSymlinks    int               `json:"broken_symlinks"`
-    PermissionDenied  int               `json:"permission_denied"`
-    FileTypes         map[string]int    `json:"file_types"`
+    TotalFiles        int64            `json:"total_files"`
+    TotalDirs         int64            `json:"total_dirs"`
+    TotalSymlinks     int64            `json:"total_symlinks"`
+    TotalSockets      int64            `json:"total_sockets"`
+    TotalFifos        int64            `json:"total_fifos"`
+    TotalDevices      int64            `json:"total_devices"`
+    Extensions        map[string]int64 `json:"extensions"`
+    LargestFiles      []FileInfo       `json:"largest_files"`
+    OldestFiles       []FileInfo       `json:"oldest_files"`
+    NewestFiles       []FileInfo       `json:"newest_files"`
+    LargestDirs       []DirInfo        `json:"largest_dirs"`
+    Permissions       map[string]int64 `json:"permissions"`
+    Owners            map[string]int64 `json:"owners"`
+    Groups            map[string]int64 `json:"groups"`
+    AgeDistribution   map[string]int64 `json:"age_distribution"`
+    SizeDistribution  map[string]int64 `json:"size_distribution"`
+    Duplicates        []DuplicateSet   `json:"duplicates"`
+    EmptyFiles        int64            `json:"empty_files"`
+    EmptyDirs         int64            `json:"empty_dirs"`
+    BrokenSymlinks    int64            `json:"broken_symlinks"`
+    PermissionDenied  int64            `json:"permission_denied"`
+    FileTypes         map[string]int64 `json:"file_types"`
 }
 
 type FileMetadata struct {
@@ -164,18 +168,17 @@ func NewInodeAnalyzer(threads int, followSymlinks bool, excludePatterns []string
     
     return &InodeAnalyzer{
         stats: Stats{
-            Extensions:      make(map[string]int),
-            Permissions:     make(map[string]int),
-            Owners:          make(map[string]int),
-            Groups:          make(map[string]int),
-            AgeDistribution: make(map[string]int),
-            SizeDistribution: make(map[string]int),
-            FileTypes:       make(map[string]int),
+            Extensions:      make(map[string]int64),
+            Permissions:     make(map[string]int64),
+            Owners:          make(map[string]int64),
+            Groups:          make(map[string]int64),
+            AgeDistribution: make(map[string]int64),
+            SizeDistribution: make(map[string]int64),
+            FileTypes:       make(map[string]int64),
         },
         threads:         threads,
         followSymlinks:  followSymlinks,
         excludePatterns: excludePatterns,
-        processedPaths:  make(map[string]bool),
         largestHeap:     largestHeap,
         oldestHeap:      oldestHeap,
         newestHeap:      newestHeap,
@@ -189,14 +192,15 @@ func (ia *InodeAnalyzer) setupSignalHandler() {
     go func() {
         <-c
         fmt.Println("\nInterrupt received, finishing current operations...")
-        ia.mu.Lock()
-        ia.interrupted = true
-        ia.mu.Unlock()
+        ia.interrupted.Store(true)
         close(ia.progressDone)
     }()
 }
 
 func (ia *InodeAnalyzer) humanReadableSize(bytes int64) string {
+    if bytes < 0 {
+        return "0 B"
+    }
     const unit = 1024
     if bytes < unit {
         return fmt.Sprintf("%d B", bytes)
@@ -209,7 +213,7 @@ func (ia *InodeAnalyzer) humanReadableSize(bytes int64) string {
     return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
 
-func (ia *InodeAnalyzer) humanReadableNumber(n int) string {
+func (ia *InodeAnalyzer) humanReadableNumber(n int64) string {
     switch {
     case n >= 1e9:
         return fmt.Sprintf("%.1fB", float64(n)/1e9)
@@ -278,14 +282,40 @@ func (ia *InodeAnalyzer) isCharDevice(mode os.FileMode) bool {
     return mode&os.ModeCharDevice != 0
 }
 
-func (ia *InodeAnalyzer) AnalyzeDirectory(path string, sampleSize int, deepScan, findDuplicates bool, exportJSON, generatePlot string, ageDays *int, saveState, loadState *string, maxDepth *int) {
+func (ia *InodeAnalyzer) updateProgress() {
+    ticker := time.NewTicker(500 * time.Millisecond)
+    defer ticker.Stop()
+    
+    for {
+        select {
+        case <-ticker.C:
+            processed := ia.itemsProcessed.Load()
+            total := ia.totalItems.Load()
+            
+            if total > 0 {
+                pct := float64(processed) / float64(total) * 100
+                elapsed := time.Since(ia.startTime).Round(time.Second)
+                fmt.Printf("\r  Progress: %.1f%% (%d/%d) [%v elapsed]", 
+                    pct, processed, total, elapsed)
+            }
+            
+        case <-ia.progressDone:
+            return
+        }
+    }
+}
+
+func (ia *InodeAnalyzer) AnalyzeDirectory(path string, sampleSize int, deepScan, findDuplicates bool, 
+    exportJSON, generatePlot string, ageDays *int, saveState, loadState *string, maxDepth *int) {
+    
     ia.setupSignalHandler()
+    ia.startTime = time.Now()
     
     if sampleSize <= 0 {
         sampleSize = 20
     }
     
-    if loadState != nil {
+    if loadState != nil && *loadState != "" {
         ia.loadCheckpoint(*loadState)
         return
     }
@@ -302,8 +332,6 @@ func (ia *InodeAnalyzer) AnalyzeDirectory(path string, sampleSize int, deepScan,
         return
     }
 
-    startTime := time.Now()
-
     fmt.Println(strings.Repeat("=", 60))
     fmt.Printf("Inode Analyzer - %s\n", absPath)
     fmt.Println(strings.Repeat("=", 60))
@@ -319,6 +347,10 @@ func (ia *InodeAnalyzer) AnalyzeDirectory(path string, sampleSize int, deepScan,
     if maxDepth != nil {
         fmt.Printf("Max Depth: %d\n", *maxDepth)
     }
+    if ageDays != nil {
+        fmt.Printf("Age Filter: > %d days\n", *ageDays)
+    }
+    fmt.Printf("Threads: %d\n", ia.threads)
     fmt.Println()
 
     if deepScan {
@@ -327,15 +359,15 @@ func (ia *InodeAnalyzer) AnalyzeDirectory(path string, sampleSize int, deepScan,
         ia.quickScanAnalysis(absPath, sampleSize, maxDepth)
     }
 
-    if findDuplicates && !deepScan && !ia.interrupted {
+    if findDuplicates && !deepScan && !ia.interrupted.Load() {
         ia.findDuplicateFiles(absPath)
     }
 
-    if saveState != nil {
+    if saveState != nil && *saveState != "" && !ia.interrupted.Load() {
         ia.saveCheckpoint(*saveState)
     }
 
-    elapsedTime := time.Since(startTime)
+    elapsedTime := time.Since(ia.startTime)
     ia.printReport(elapsedTime)
 
     if exportJSON != "" {
@@ -350,40 +382,43 @@ func (ia *InodeAnalyzer) AnalyzeDirectory(path string, sampleSize int, deepScan,
 func (ia *InodeAnalyzer) quickScanAnalysis(root string, sampleSize int, maxDepth *int) {
     fmt.Println("Scanning filesystem...")
 
-    baseDepth := 0
-    for _, c := range root {
-        if c == filepath.Separator {
-            baseDepth++
+    filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+        if err == nil {
+            ia.totalItems.Add(1)
         }
-    }
+        return nil
+    })
+
+    ia.itemsProcessed.Store(0)
+    go ia.updateProgress()
 
     err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-        ia.mu.RLock()
-        if ia.interrupted {
-            ia.mu.RUnlock()
+        if ia.interrupted.Load() {
             return filepath.SkipDir
         }
-        ia.mu.RUnlock()
 
         if err != nil {
             ia.mu.Lock()
             ia.stats.PermissionDenied++
             ia.mu.Unlock()
+            ia.itemsProcessed.Add(1)
             return nil
         }
 
         if maxDepth != nil {
-            currentDepth := 0
-            for _, c := range path[len(root):] {
-                if c == filepath.Separator {
-                    currentDepth++
+            if len(path) > len(root) {
+                relPath := path[len(root):]
+                if strings.HasPrefix(relPath, string(filepath.Separator)) {
+                    relPath = relPath[1:]
                 }
-            }
-            if currentDepth > *maxDepth {
-                if info.IsDir() {
-                    return filepath.SkipDir
+                currentDepth := strings.Count(relPath, string(filepath.Separator)) + 1
+                if currentDepth > *maxDepth {
+                    if info.IsDir() {
+                        return filepath.SkipDir
+                    }
+                    ia.itemsProcessed.Add(1)
+                    return nil
                 }
-                return nil
             }
         }
 
@@ -391,6 +426,7 @@ func (ia *InodeAnalyzer) quickScanAnalysis(root string, sampleSize int, maxDepth
             if info.IsDir() {
                 return filepath.SkipDir
             }
+            ia.itemsProcessed.Add(1)
             return nil
         }
 
@@ -404,6 +440,7 @@ func (ia *InodeAnalyzer) quickScanAnalysis(root string, sampleSize int, maxDepth
                 ia.stats.EmptyDirs++
             }
             ia.mu.Unlock()
+            ia.itemsProcessed.Add(1)
             return nil
         }
 
@@ -441,168 +478,146 @@ func (ia *InodeAnalyzer) quickScanAnalysis(root string, sampleSize int, maxDepth
             ia.mu.Unlock()
 
         case mode.IsRegular():
-            ia.mu.Lock()
-            ia.stats.TotalFiles++
-            ia.stats.FileTypes["regular"]++
-            ia.mu.Unlock()
-
-            size := info.Size()
-            ia.mu.Lock()
-            ia.totalSize += size
-            ia.mu.Unlock()
-
-            ext := strings.TrimPrefix(filepath.Ext(info.Name()), ".")
-            
-            owner := "unknown"
-            group := "unknown"
-            if stat != nil {
-                owner = ia.getOwnerInfo(stat.Uid)
-                group = ia.getGroupInfo(stat.Gid)
-            }
-            
-            perms := fmt.Sprintf("%04o", mode.Perm())
-
-            ia.mu.Lock()
-            if ext != "" {
-                ia.stats.Extensions[ext]++
-            }
-            ia.stats.Permissions[perms]++
-            ia.stats.Owners[owner]++
-            ia.stats.Groups[group]++
-
-            sizeCat := ia.categorizeSize(size)
-            ia.stats.SizeDistribution[sizeCat]++
-
-            if size == 0 {
-                ia.stats.EmptyFiles++
-            }
-
-            ageCat := ia.categorizeAge(info.ModTime())
-            ia.stats.AgeDistribution[ageCat]++
-
-            metadata := FileMetadata{
-                Path:        path,
-                Size:        size,
-                Modified:    info.ModTime(),
-                Owner:       owner,
-                Group:       group,
-                Permissions: perms,
-                Extension:   ext,
-            }
-            ia.fileMetadata.Store(path, metadata)
-            ia.mu.Unlock()
-
-            fileInfo := FileInfo{
-                Size:        size,
-                Path:        path,
-                Modified:    info.ModTime(),
-                Owner:       owner,
-                Group:       group,
-                Permissions: perms,
-            }
-
-            ia.heapMu.Lock()
-            heap.Push(ia.largestHeap, fileInfo)
-            if ia.largestHeap.Len() > sampleSize*2 {
-                heap.Pop(ia.largestHeap)
-            }
-
-            heap.Push(ia.oldestHeap, fileInfo)
-            if ia.oldestHeap.Len() > sampleSize*2 {
-                heap.Pop(ia.oldestHeap)
-            }
-
-            heap.Push(ia.newestHeap, fileInfo)
-            if ia.newestHeap.Len() > sampleSize*2 {
-                heap.Pop(ia.newestHeap)
-            }
-            ia.heapMu.Unlock()
+            ia.processRegularFile(path, info, stat)
         }
 
+        ia.itemsProcessed.Add(1)
         return nil
     })
 
-    if err != nil && !ia.interrupted {
-        fmt.Printf("Error walking directory: %v\n", err)
+    if err != nil && !ia.interrupted.Load() {
+        fmt.Printf("\nError walking directory: %v\n", err)
     }
+
+    close(ia.progressDone)
+    fmt.Printf("\r  Progress: 100%% (%d/%d) [%v elapsed]\n", 
+        ia.totalItems.Load(), ia.totalItems.Load(), time.Since(ia.startTime).Round(time.Second))
 
     ia.finalizeStats(sampleSize)
     ia.analyzeLargestDirectories(root, sampleSize)
 }
 
-func (ia *InodeAnalyzer) deepScanAnalysis(root string, sampleSize int, findDuplicates bool, ageDays *int, maxDepth *int) {
+func (ia *InodeAnalyzer) processRegularFile(path string, info os.FileInfo, stat *syscall.Stat_t) {
+    size := info.Size()
+    
+    ia.mu.Lock()
+    ia.stats.TotalFiles++
+    ia.stats.FileTypes["regular"]++
+    atomic.AddInt64(&ia.totalSize, size)
+    ia.mu.Unlock()
+
+    ext := strings.TrimPrefix(filepath.Ext(info.Name()), ".")
+    
+    owner := "unknown"
+    group := "unknown"
+    if stat != nil {
+        owner = ia.getOwnerInfo(stat.Uid)
+        group = ia.getGroupInfo(stat.Gid)
+    }
+    
+    perms := fmt.Sprintf("%04o", info.Mode().Perm())
+
+    ia.mu.Lock()
+    if ext != "" {
+        ia.stats.Extensions[ext]++
+    }
+    ia.stats.Permissions[perms]++
+    ia.stats.Owners[owner]++
+    ia.stats.Groups[group]++
+
+    sizeCat := ia.categorizeSize(size)
+    ia.stats.SizeDistribution[sizeCat]++
+
+    if size == 0 {
+        ia.stats.EmptyFiles++
+    }
+
+    ageCat := ia.categorizeAge(info.ModTime())
+    ia.stats.AgeDistribution[ageCat]++
+
+    metadata := FileMetadata{
+        Path:        path,
+        Size:        size,
+        Modified:    info.ModTime(),
+        Owner:       owner,
+        Group:       group,
+        Permissions: perms,
+        Extension:   ext,
+    }
+    ia.fileMetadata.Store(path, metadata)
+    ia.mu.Unlock()
+
+    fileInfo := FileInfo{
+        Size:        size,
+        Path:        path,
+        Modified:    info.ModTime(),
+        Owner:       owner,
+        Group:       group,
+        Permissions: perms,
+    }
+
+    ia.heapMu.Lock()
+    heap.Push(ia.largestHeap, fileInfo)
+    if ia.largestHeap.Len() > 1000 {
+        heap.Pop(ia.largestHeap)
+    }
+
+    heap.Push(ia.oldestHeap, fileInfo)
+    if ia.oldestHeap.Len() > 1000 {
+        heap.Pop(ia.oldestHeap)
+    }
+
+    heap.Push(ia.newestHeap, fileInfo)
+    if ia.newestHeap.Len() > 1000 {
+        heap.Pop(ia.newestHeap)
+    }
+    ia.heapMu.Unlock()
+}
+
+func (ia *InodeAnalyzer) deepScanAnalysis(root string, sampleSize int, findDuplicates bool, 
+    ageDays *int, maxDepth *int) {
+    
     fmt.Println("Deep Analysis\n")
 
+    filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+        if err == nil && !ia.shouldExclude(path) {
+            ia.totalItems.Add(1)
+        }
+        return nil
+    })
+
+    ia.itemsProcessed.Store(0)
+    go ia.updateProgress()
+
     work := make(chan string, ia.threads*2)
-    var processed int32
-    var totalItems int32
 
     for i := 0; i < ia.threads; i++ {
         ia.wg.Add(1)
-        go ia.deepWorker(work, &processed, &totalItems, ageDays)
-    }
-
-    go func() {
-        ticker := time.NewTicker(100 * time.Millisecond)
-        defer ticker.Stop()
-        
-        for {
-            select {
-            case <-ticker.C:
-                current := atomic.LoadInt32(&processed)
-                total := atomic.LoadInt32(&totalItems)
-                
-                if total > 0 {
-                    pct := float64(current) / float64(total) * 100
-                    fmt.Printf("\r  Progress: %.1f%% (%d/%d)", pct, current, total)
-                }
-                
-                if current >= total && total > 0 {
-                    return
-                }
-                
-            case <-ia.progressDone:
-                return
-            }
-        }
-    }()
-
-    baseDepth := 0
-    for _, c := range root {
-        if c == filepath.Separator {
-            baseDepth++
-        }
+        go ia.deepWorker(work, ageDays)
     }
 
     err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-        if err != nil {
-            return nil
-        }
-
-        ia.mu.RLock()
-        if ia.interrupted {
-            ia.mu.RUnlock()
+        if err != nil || ia.interrupted.Load() {
             return filepath.SkipDir
         }
-        ia.mu.RUnlock()
 
         if maxDepth != nil {
-            currentDepth := 0
-            for _, c := range path[len(root):] {
-                if c == filepath.Separator {
-                    currentDepth++
+            if len(path) > len(root) {
+                relPath := path[len(root):]
+                if strings.HasPrefix(relPath, string(filepath.Separator)) {
+                    relPath = relPath[1:]
                 }
-            }
-            if currentDepth > *maxDepth {
-                if info.IsDir() {
-                    return filepath.SkipDir
+                currentDepth := strings.Count(relPath, string(filepath.Separator)) + 1
+                if currentDepth > *maxDepth {
+                    if info.IsDir() {
+                        return filepath.SkipDir
+                    }
+                    return nil
                 }
-                return nil
             }
         }
 
         if !ia.shouldExclude(path) {
-            atomic.AddInt32(&totalItems, 1)
             select {
             case work <- path:
             case <-ia.progressDone:
@@ -616,37 +631,30 @@ func (ia *InodeAnalyzer) deepScanAnalysis(root string, sampleSize int, findDupli
     ia.wg.Wait()
     close(ia.progressDone)
 
-    if err != nil && !ia.interrupted {
-        fmt.Printf("Error walking directory: %v\n", err)
+    if err != nil && !ia.interrupted.Load() {
+        fmt.Printf("\nError walking directory: %v\n", err)
     }
 
-    if !ia.interrupted {
-        total := atomic.LoadInt32(&totalItems)
-        fmt.Printf("\r  Progress: 100%% (%d/%d)\n", total, total)
-    } else {
-        fmt.Println("\nScan interrupted - partial results")
-    }
+    total := ia.totalItems.Load()
+    fmt.Printf("\r  Progress: 100%% (%d/%d) [%v elapsed]\n", 
+        total, total, time.Since(ia.startTime).Round(time.Second))
 
     ia.finalizeStats(sampleSize)
     ia.analyzeLargestDirectories(root, sampleSize)
 
-    if findDuplicates && !ia.interrupted {
+    if findDuplicates && !ia.interrupted.Load() {
         ia.findDuplicateFiles(root)
     }
 }
 
-func (ia *InodeAnalyzer) deepWorker(work <-chan string, processed, totalItems *int32, ageDays *int) {
+func (ia *InodeAnalyzer) deepWorker(work <-chan string, ageDays *int) {
     defer ia.wg.Done()
     for path := range work {
-        ia.mu.RLock()
-        if ia.interrupted {
-            ia.mu.RUnlock()
+        if ia.interrupted.Load() {
             return
         }
-        ia.mu.RUnlock()
-
         ia.analyzeItemDeep(path, ageDays)
-        atomic.AddInt32(processed, 1)
+        ia.itemsProcessed.Add(1)
     }
 }
 
@@ -726,7 +734,7 @@ func (ia *InodeAnalyzer) analyzeItemDeep(path string, ageDays *int) {
         ia.mu.Lock()
         ia.stats.TotalFiles++
         ia.stats.FileTypes["regular"]++
-        ia.totalSize += size
+        atomic.AddInt64(&ia.totalSize, size)
 
         if ext != "" {
             ia.stats.Extensions[ext]++
@@ -790,22 +798,28 @@ func (ia *InodeAnalyzer) finalizeStats(sampleSize int) {
     defer ia.heapMu.Unlock()
 
     largest := make([]FileInfo, 0, min(sampleSize, ia.largestHeap.Len()))
-    for i := 0; i < min(sampleSize, ia.largestHeap.Len()); i++ {
-        largest = append(largest, (*ia.largestHeap)[i])
+    h := *ia.largestHeap
+    for i := 0; i < min(sampleSize, len(h)); i++ {
+        largest = append(largest, h[i])
     }
-    ia.stats.LargestFiles = largest
-
+    
     oldest := make([]FileInfo, 0, min(sampleSize, ia.oldestHeap.Len()))
-    for i := 0; i < min(sampleSize, ia.oldestHeap.Len()); i++ {
-        oldest = append(oldest, (*ia.oldestHeap)[i])
+    h2 := *ia.oldestHeap
+    for i := 0; i < min(sampleSize, len(h2)); i++ {
+        oldest = append(oldest, h2[i])
     }
-    ia.stats.OldestFiles = oldest
-
+    
     newest := make([]FileInfo, 0, min(sampleSize, ia.newestHeap.Len()))
-    for i := 0; i < min(sampleSize, ia.newestHeap.Len()); i++ {
-        newest = append(newest, (*ia.newestHeap)[i])
+    h3 := *ia.newestHeap
+    for i := 0; i < min(sampleSize, len(h3)); i++ {
+        newest = append(newest, h3[i])
     }
+
+    ia.mu.Lock()
+    ia.stats.LargestFiles = largest
+    ia.stats.OldestFiles = oldest
     ia.stats.NewestFiles = newest
+    ia.mu.Unlock()
 }
 
 func (ia *InodeAnalyzer) analyzeLargestDirectories(root string, sampleSize int) {
@@ -852,6 +866,7 @@ func (ia *InodeAnalyzer) analyzeLargestDirectories(root string, sampleSize int) 
     })
 
     ia.mu.Lock()
+    ia.stats.LargestDirs = make([]DirInfo, 0, min(sampleSize, len(dirs)))
     for i := 0; i < min(sampleSize, len(dirs)); i++ {
         ia.stats.LargestDirs = append(ia.stats.LargestDirs, dirs[i])
     }
@@ -859,18 +874,15 @@ func (ia *InodeAnalyzer) analyzeLargestDirectories(root string, sampleSize int) 
 }
 
 func (ia *InodeAnalyzer) findDuplicateFiles(root string) {
-    fmt.Println("Duplicate file detection...")
+    fmt.Println("\nDuplicate file detection...")
 
     sizeDict := make(map[int64][]string)
-    fileCount := 0
+    var fileCount int64
 
-    err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-        ia.mu.RLock()
-        if ia.interrupted {
-            ia.mu.RUnlock()
+    filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+        if ia.interrupted.Load() {
             return filepath.SkipDir
         }
-        ia.mu.RUnlock()
 
         if err != nil || info.IsDir() || ia.shouldExclude(path) {
             return nil
@@ -883,7 +895,7 @@ func (ia *InodeAnalyzer) findDuplicateFiles(root string) {
         return nil
     })
 
-    if err != nil || ia.interrupted {
+    if ia.interrupted.Load() {
         return
     }
 
@@ -896,7 +908,7 @@ func (ia *InodeAnalyzer) findDuplicateFiles(root string) {
 
     fmt.Printf("  Files: %s | Candidates: %s\n",
         ia.humanReadableNumber(fileCount),
-        ia.humanReadableNumber(totalCandidates))
+        ia.humanReadableNumber(int64(totalCandidates)))
     fmt.Println("  Computing checksums...")
 
     processed := 0
@@ -918,12 +930,9 @@ func (ia *InodeAnalyzer) findDuplicateFiles(root string) {
         go func() {
             defer wg.Done()
             for paths := range work {
-                ia.mu.RLock()
-                if ia.interrupted {
-                    ia.mu.RUnlock()
+                if ia.interrupted.Load() {
                     return
                 }
-                ia.mu.RUnlock()
 
                 checksumDict := make(map[string][]string)
                 for _, path := range paths {
@@ -963,7 +972,9 @@ func (ia *InodeAnalyzer) findDuplicateFiles(root string) {
     }
 
     wg.Wait()
-    fmt.Printf("\r      Progress: %d/%d\n", totalCandidates, totalCandidates)
+    if !ia.interrupted.Load() {
+        fmt.Printf("\r      Progress: %d/%d\n", totalCandidates, totalCandidates)
+    }
 
     sort.Slice(duplicates, func(i, j int) bool {
         return duplicates[i].WastedSpace > duplicates[j].WastedSpace
@@ -978,7 +989,7 @@ func (ia *InodeAnalyzer) findDuplicateFiles(root string) {
         totalWasted += d.WastedSpace
     }
     fmt.Printf("  Duplicate sets: %s | Wasted: %s\n",
-        ia.humanReadableNumber(len(duplicates)),
+        ia.humanReadableNumber(int64(len(duplicates))),
         ia.humanReadableSize(totalWasted))
 }
 
@@ -1041,8 +1052,8 @@ func (ia *InodeAnalyzer) printReport(elapsed time.Duration) {
         }
 
         fmt.Println("\nDuplicate Files:")
-        fmt.Printf("  Duplicate sets:      %18s\n", ia.humanReadableNumber(len(ia.stats.Duplicates)))
-        fmt.Printf("  Duplicate files:     %18s\n", ia.humanReadableNumber(totalDuplicateFiles))
+        fmt.Printf("  Duplicate sets:      %18s\n", ia.humanReadableNumber(int64(len(ia.stats.Duplicates))))
+        fmt.Printf("  Duplicate files:     %18s\n", ia.humanReadableNumber(int64(totalDuplicateFiles)))
         fmt.Printf("  Wasted space:        %18s\n", ia.humanReadableSize(totalWasted))
     }
 
@@ -1050,7 +1061,7 @@ func (ia *InodeAnalyzer) printReport(elapsed time.Duration) {
         fmt.Println("\nExtensions:")
         type extCount struct {
             ext   string
-            count int
+            count int64
         }
         var exts []extCount
         for ext, count := range ia.stats.Extensions {
@@ -1072,7 +1083,7 @@ func (ia *InodeAnalyzer) printReport(elapsed time.Duration) {
         fmt.Println("\nOwners:")
         type ownerCount struct {
             owner string
-            count int
+            count int64
         }
         var owners []ownerCount
         for owner, count := range ia.stats.Owners {
@@ -1125,7 +1136,7 @@ func (ia *InodeAnalyzer) printReport(elapsed time.Duration) {
         }
     }
 
-    if ia.interrupted {
+    if ia.interrupted.Load() {
         fmt.Println("\n" + strings.Repeat("!", 50))
         fmt.Println("  Scan interrupted - partial results")
         fmt.Println(strings.Repeat("!", 50))
@@ -1138,18 +1149,20 @@ func (ia *InodeAnalyzer) exportJSON(outputFile string) {
 
     export := struct {
         Stats
-        TotalInodes     int    `json:"total_inodes"`
+        TotalInodes     int64  `json:"total_inodes"`
         TotalSizeHuman  string `json:"total_size_human"`
         TotalSize       int64  `json:"total_size"`
         ScanTime        string `json:"scan_time"`
         Interrupted     bool   `json:"interrupted"`
+        ElapsedSeconds  float64 `json:"elapsed_seconds"`
     }{
         Stats:           ia.stats,
         TotalInodes:     totalInodes,
         TotalSizeHuman:  ia.humanReadableSize(ia.totalSize),
         TotalSize:       ia.totalSize,
         ScanTime:        time.Now().Format("2006-01-02 15:04:05"),
-        Interrupted:     ia.interrupted,
+        Interrupted:     ia.interrupted.Load(),
+        ElapsedSeconds:  time.Since(ia.startTime).Seconds(),
     }
 
     data, err := json.MarshalIndent(export, "", "  ")
@@ -1167,24 +1180,26 @@ func (ia *InodeAnalyzer) exportJSON(outputFile string) {
 }
 
 func (ia *InodeAnalyzer) saveCheckpoint(checkpointFile string) {
+    processedPaths := make([]string, 0)
+    ia.processedPaths.Range(func(key, value interface{}) bool {
+        if len(processedPaths) < 10000 {
+            processedPaths = append(processedPaths, key.(string))
+        }
+        return true
+    })
+
     checkpoint := struct {
-        Stats          Stats
-        TotalSize      int64
-        ProcessedPaths []string
-        Timestamp      string
-        Interrupted    bool
+        Stats          Stats    `json:"stats"`
+        TotalSize      int64    `json:"total_size"`
+        ProcessedPaths []string `json:"processed_paths"`
+        Timestamp      string   `json:"timestamp"`
+        Interrupted    bool     `json:"interrupted"`
     }{
         Stats:          ia.stats,
         TotalSize:      ia.totalSize,
-        ProcessedPaths: make([]string, 0, len(ia.processedPaths)),
+        ProcessedPaths: processedPaths,
         Timestamp:      time.Now().Format("2006-01-02 15:04:05"),
-        Interrupted:    ia.interrupted,
-    }
-
-    for path := range ia.processedPaths {
-        if len(checkpoint.ProcessedPaths) < 10000 {
-            checkpoint.ProcessedPaths = append(checkpoint.ProcessedPaths, path)
-        }
+        Interrupted:    ia.interrupted.Load(),
     }
 
     data, err := json.Marshal(checkpoint)
@@ -1209,11 +1224,11 @@ func (ia *InodeAnalyzer) loadCheckpoint(checkpointFile string) {
     }
 
     var checkpoint struct {
-        Stats          Stats
-        TotalSize      int64
-        ProcessedPaths []string
-        Timestamp      string
-        Interrupted    bool
+        Stats          Stats    `json:"stats"`
+        TotalSize      int64    `json:"total_size"`
+        ProcessedPaths []string `json:"processed_paths"`
+        Timestamp      string   `json:"timestamp"`
+        Interrupted    bool     `json:"interrupted"`
     }
 
     if err := json.Unmarshal(data, &checkpoint); err != nil {
@@ -1221,13 +1236,14 @@ func (ia *InodeAnalyzer) loadCheckpoint(checkpointFile string) {
         return
     }
 
+    ia.mu.Lock()
     ia.stats = checkpoint.Stats
     ia.totalSize = checkpoint.TotalSize
-    ia.processedPaths = make(map[string]bool)
     for _, path := range checkpoint.ProcessedPaths {
-        ia.processedPaths[path] = true
+        ia.processedPaths.Store(path, true)
     }
-    ia.interrupted = checkpoint.Interrupted
+    ia.interrupted.Store(checkpoint.Interrupted)
+    ia.mu.Unlock()
 
     fmt.Printf("\nLoaded: %s\n", checkpointFile)
     fmt.Printf("  Date: %s\n", checkpoint.Timestamp)
@@ -1240,7 +1256,7 @@ func min(a, b int) int {
     return b
 }
 
-func max(a, b int) int {
+func max(a, b int64) int64 {
     if a > b {
         return a
     }
@@ -1250,12 +1266,57 @@ func max(a, b int) int {
 func main() {
     runtime.GOMAXPROCS(runtime.NumCPU())
 
-    analyzer := NewInodeAnalyzer(runtime.NumCPU(), false, nil)
+    var (
+        path         = flag.String("path", ".", "Path to analyze")
+        samples      = flag.Int("samples", 20, "Number of samples to keep")
+        deep         = flag.Bool("deep", false, "Enable deep scan")
+        duplicates   = flag.Bool("duplicates", false, "Find duplicate files")
+        threads      = flag.Int("threads", runtime.NumCPU(), "Number of worker threads")
+        follow       = flag.Bool("follow", false, "Follow symlinks")
+        exclude      = flag.String("exclude", "", "Comma-separated exclude patterns")
+        maxDepth     = flag.Int("max-depth", 0, "Maximum directory depth")
+        age          = flag.Int("age", 0, "Only show files newer than AGE days")
+        json         = flag.String("json", "", "Export results to JSON file")
+        saveState    = flag.String("save-state", "", "Save checkpoint to file")
+        loadState    = flag.String("load-state", "", "Load checkpoint from file")
+        version      = flag.Bool("version", false, "Show version")
+    )
+    
+    flag.Parse()
 
-    path := "."
-    if len(os.Args) > 1 {
-        path = os.Args[1]
+    if *version {
+        fmt.Println("Inode Analyzer 2.0 (Go)")
+        fmt.Printf("Built with Go %s\n", runtime.Version())
+        return
     }
 
-    analyzer.AnalyzeDirectory(path, 20, false, false, "", "", nil, nil, nil, nil)
+    excludePatterns := []string{}
+    if *exclude != "" {
+        excludePatterns = strings.Split(*exclude, ",")
+    }
+
+    var ageDays *int
+    if *age > 0 {
+        ageDays = age
+    }
+
+    var maxDepthPtr *int
+    if *maxDepth > 0 {
+        maxDepthPtr = maxDepth
+    }
+
+    analyzer := NewInodeAnalyzer(*threads, *follow, excludePatterns)
+
+    analyzer.AnalyzeDirectory(
+        *path,
+        *samples,
+        *deep,
+        *duplicates,
+        *json,
+        "",
+        ageDays,
+        saveState,
+        loadState,
+        maxDepthPtr,
+    )
 }
