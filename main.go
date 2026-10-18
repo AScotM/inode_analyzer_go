@@ -208,7 +208,7 @@ type Analyzer struct {
 func newAnalyzer(o Options) *Analyzer {
 	return &Analyzer{
 		options: o,
-		stats:   Stats{Version: "4.0", Root: o.Root, Started: time.Now(), Extensions: map[string]int64{}, Permissions: map[string]int64{}, Owners: map[string]int64{}, Groups: map[string]int64{}, SizeDistribution: map[string]int64{}, AgeDistribution: map[string]int64{}},
+		stats:   Stats{Version: "5.0", Root: o.Root, Started: time.Now(), Extensions: map[string]int64{}, Permissions: map[string]int64{}, Owners: map[string]int64{}, Groups: map[string]int64{}, SizeDistribution: map[string]int64{}, AgeDistribution: map[string]int64{}},
 		dirs:    make(map[string]*DirInfo), seenFiles: make(map[inodeKey]struct{}), duplicateCandidates: make(map[int64][]FileInfo), seenDirs: make(map[inodeKey]struct{}), uniquePaths: make(map[inodeKey]string), depthCounts: make(map[int]*DepthInfo), extBytes: make(map[string]*ExtensionInfo), ownerBytes: make(map[uint32]*OwnerInfo),
 	}
 }
@@ -235,10 +235,13 @@ func human(n int64) string {
 }
 
 func (a *Analyzer) reportError(path string, err error) {
+	if err == nil {
+		return
+	}
 	a.mu.Lock()
 	a.stats.Errors++
 	a.mu.Unlock()
-	if a.errorsPrinted.Add(1) <= 10 {
+	if !a.options.Quiet && a.errorsPrinted.Add(1) <= 10 {
 		fmt.Fprintf(os.Stderr, "Warning: %s: %v\n", path, err)
 	}
 }
@@ -346,6 +349,9 @@ func (a *Analyzer) addFile(path string, info os.FileInfo) {
 		a.seenFiles[key] = struct{}{}
 		s.UniqueInodes++
 		s.UniqueLogicalBytes += f.Size
+		if st, ok := info.Sys().(*syscall.Stat_t); ok {
+			s.PhysicalBytes += int64(st.Blocks) * 512
+		}
 		a.uniquePaths[key] = f.Path
 	} else {
 		s.HardlinkAliases++
@@ -587,7 +593,16 @@ func (a *Analyzer) detectDuplicates(ctx context.Context) {
 					if ctx.Err() != nil {
 						return
 					}
+					before, statErr := os.Stat(f.Path)
+					if statErr != nil || !before.Mode().IsRegular() || before.Size() != f.Size || !before.ModTime().Equal(f.Modified) {
+						a.reportError(f.Path, fmt.Errorf("file changed before hashing"))
+						continue
+					}
 					hash, err := fileHash(ctx, f.Path)
+					after, afterErr := os.Stat(f.Path)
+					if err == nil && (afterErr != nil || after.Size() != before.Size() || !after.ModTime().Equal(before.ModTime())) {
+						err = fmt.Errorf("file changed during hashing")
+					}
 					if err != nil {
 						a.reportError(f.Path, err)
 						continue
@@ -746,7 +761,7 @@ func metric(w *tabwriter.Writer, label, value, detail string) {
 
 func report(s Stats, limit int) {
 	fmt.Println(strings.Repeat("=", 96))
-	fmt.Println("  INODE ANALYZER 4.0   |   LINUX FILESYSTEM FORENSICS")
+	fmt.Println("  INODE ANALYZER 5.0   |   LINUX FILESYSTEM FORENSICS")
 	fmt.Println(strings.Repeat("=", 96))
 	fmt.Printf("  Root:     %s\n", s.Root)
 	fmt.Printf("  Started:  %s\n", s.Started.Local().Format("2006-01-02 15:04:05 MST"))
@@ -849,7 +864,7 @@ func main() {
 	version := flag.Bool("version", false, "Show version")
 	flag.Parse()
 	if *version {
-		fmt.Printf("Inode Analyzer 4.0 (%s)\n", runtime.Version())
+		fmt.Printf("Inode Analyzer 5.0 (%s)\n", runtime.Version())
 		return
 	}
 	if o.Threads < 1 || o.Samples < 1 || o.MaxDepth < 0 || o.AgeDays < 0 || o.TopLimit < 0 || o.AuditLimit < 0 || o.MinSize < 0 || o.MaxSize < 0 || (o.MaxSize > 0 && o.MinSize > o.MaxSize) {
@@ -885,6 +900,14 @@ func main() {
 	o.Root = filepath.Clean(root)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	rootInfo, rootErr := os.Stat(o.Root)
+	if rootErr != nil || !rootInfo.IsDir() {
+		if rootErr == nil {
+			rootErr = fmt.Errorf("not a directory")
+		}
+		fmt.Fprintf(os.Stderr, "Invalid scan root %s: %v\n", o.Root, rootErr)
+		os.Exit(1)
+	}
 	a := newAnalyzer(o)
 	if o.FindRegex != "" {
 		a.nameRegex, err = regexp.Compile(o.FindRegex)
@@ -969,6 +992,9 @@ func main() {
 	if a.stats.Interrupted {
 		os.Exit(130)
 	}
+	if a.stats.Errors > 0 {
+		os.Exit(3)
+	}
 }
 
 func (a *Analyzer) observeFile(path string, info os.FileInfo, f FileInfo) {
@@ -1025,7 +1051,6 @@ func (a *Analyzer) observeFile(path string, info os.FileInfo, f FileInfo) {
 	}
 	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
 		allocated := int64(stat.Blocks) * 512
-		a.stats.PhysicalBytes += allocated
 		if f.Size > allocated && f.Size > 4096 {
 			a.stats.SparseFiles++
 		}
@@ -1416,9 +1441,9 @@ func htmlEndSection() string { return "</table></section>\n" }
 func writeHTML(path string, s Stats) error {
 	var b strings.Builder
 	b.WriteString("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">")
-	b.WriteString("<title>Inode Analyzer 4.0</title>")
+	b.WriteString("<title>Inode Analyzer 5.0</title>")
 	b.WriteString("<style>:root{color-scheme:dark}body{background:#111827;color:#e5e7eb;font-family:system-ui,sans-serif;max-width:1100px;margin:auto;padding:2rem}h1{letter-spacing:.03em}h2{margin-top:2.5rem;border-bottom:1px solid #374151;padding-bottom:.5rem}p{color:#9ca3af}table{width:100%;border-collapse:collapse;table-layout:fixed}th,td{text-align:left;padding:.65rem;border-bottom:1px solid #374151;overflow-wrap:anywhere}th{width:35%;color:#93c5fd}tr:hover{background:#1f2937}.tag{border:1px solid #4b5563;border-radius:4px;padding:.25rem .5rem}footer{margin-top:3rem;color:#9ca3af}</style></head><body>")
-	b.WriteString("<header><h1>Inode Analyzer 4.0</h1><p>Linux filesystem inventory and diagnostics</p></header>")
+	b.WriteString("<header><h1>Inode Analyzer 5.0</h1><p>Linux filesystem inventory and diagnostics</p></header>")
 	b.WriteString("<p><span class=\"tag\">" + htmlEscape(s.Root) + "</span></p>")
 	b.WriteString(htmlSection("Overview"))
 	for _, row := range [][2]string{
